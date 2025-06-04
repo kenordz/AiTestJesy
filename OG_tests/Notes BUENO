@@ -1,0 +1,161 @@
+import os
+from flask import Flask, request, Response
+from twilio.twiml.voice_response import VoiceResponse
+from google.cloud import speech
+from dotenv import load_dotenv
+import requests
+from requests.auth import HTTPBasicAuth
+import time
+from subprocess import run
+import openai
+
+# Cargar las variables de entorno desde el archivo .env
+load_dotenv()
+
+# Configurar la variable de entorno para Google Application Credentials
+os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = os.getenv("GOOGLE_APPLICATION_CREDENTIALS")
+
+# Configurar API Key, Voice ID de Eleven Labs, y credenciales de Twilio
+ELEVENLABS_API_KEY = os.getenv("ELEVENLABS_API_KEY")
+VOICE_ID = os.getenv("VOICE_ID")
+TWILIO_ACCOUNT_SID = os.getenv("TWILIO_ACCOUNT_SID")
+TWILIO_AUTH_TOKEN = os.getenv("TWILIO_AUTH_TOKEN")
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+
+# Configurar OpenAI
+openai.api_key = OPENAI_API_KEY
+
+app = Flask(__name__)
+
+# Función para transcribir el audio
+def transcribe_audio(audio_file_path):
+    client = speech.SpeechClient()
+    with open(audio_file_path, "rb") as audio_file:
+        audio_content = audio_file.read()
+    audio = speech.RecognitionAudio(content=audio_content)
+    config = speech.RecognitionConfig(
+        encoding=speech.RecognitionConfig.AudioEncoding.LINEAR16,
+        sample_rate_hertz=8000,  # Ajustado a 8000 Hz, la frecuencia de Twilio
+        language_code="en-US"
+    )
+    try:
+        response = client.recognize(config=config, audio=audio)
+        transcription = response.results[0].alternatives[0].transcript if response.results else ""
+        return transcription
+    except Exception as e:
+        print(f"Error en la transcripción: {e}")
+        return None
+
+# Función para generar una respuesta de OpenAI
+def get_openai_response(prompt):
+    try:
+        response = openai.ChatCompletion.create(
+            model="gpt-3.5-turbo",
+            messages=[
+                {"role": "system", "content": "You are Monica, a helpful assistant for NetConnect Services."},
+                {"role": "user", "content": prompt}
+            ],
+            max_tokens=200,
+            temperature=0.7
+        )
+        return response['choices'][0]['message']['content'].strip()
+    except Exception as e:
+        print(f"Error al generar respuesta con OpenAI: {e}")
+        return "I'm sorry, I couldn't process that."
+
+# Función para generar un archivo de audio con Eleven Labs
+def generate_audio(text):
+    url = f"https://api.elevenlabs.io/v1/text-to-speech/{VOICE_ID}"
+    headers = {
+        "Content-Type": "application/json",
+        "xi-api-key": ELEVENLABS_API_KEY
+    }
+    data = {
+        "text": text,
+        "voice_settings": {
+            "stability": 1.0,
+            "similarity_boost": 0.75
+        }
+    }
+    response = requests.post(url, json=data, headers=headers)
+    if response.status_code == 200:
+        with open("static/Response.wav", "wb") as f:
+            f.write(response.content)
+        print("Audio guardado como static/Response.wav")
+
+        # Convertir el audio a 8 kHz y mono usando ffmpeg
+        run(["ffmpeg", "-i", "static/Response.wav", "-ar", "8000", "-ac", "1", "static/Response_Converted.wav", "-y"])
+        print("Archivo convertido y guardado como static/Response_Converted.wav")
+        return "static/Response_Converted.wav"
+    else:
+        print(f"Error en la solicitud: {response.status_code}")
+        print(response.json())
+        return None
+
+# Endpoint para manejar la llamada y grabación
+@app.route("/voice", methods=["POST"])
+def voice():
+    response = VoiceResponse()
+    response.say("Thank you for calling. This call will be recorded.")
+    response.record(action="/process-recording", method="POST")
+    return str(response)
+
+# Endpoint para procesar la grabación
+@app.route("/process-recording", methods=["POST"])
+def process_recording():
+    user_audio_url = request.values.get("RecordingUrl")
+    if user_audio_url:
+        print(f"RecordingUrl recibido: {user_audio_url}")
+
+        # Esperar antes de descargar
+        time.sleep(2)
+
+        # Descargar el audio grabado con autenticación básica
+        audio_path = "static/UserAudio.wav"
+        response = requests.get(user_audio_url, auth=HTTPBasicAuth(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN))
+        if response.status_code == 200:
+            with open(audio_path, "wb") as f:
+                f.write(response.content)
+            print(f"Audio del usuario guardado como {audio_path}")
+
+            # Convertir el audio a formato compatible con Google Speech
+            converted_audio_path = "static/UserAudio_Converted.wav"
+            run(["ffmpeg", "-i", audio_path, "-ar", "8000", "-ac", "1", converted_audio_path, "-y"])
+            print(f"Audio convertido y guardado como {converted_audio_path}")
+
+            # Transcribir el audio
+            transcription = transcribe_audio(converted_audio_path)
+            print(f"Transcripción: {transcription}")
+
+            # Obtener respuesta de OpenAI
+            if transcription:
+                openai_response = get_openai_response(transcription)
+                print(f"Respuesta de OpenAI: {openai_response}")
+
+                # Generar respuesta de audio
+                response_audio_path = generate_audio(openai_response)
+                if response_audio_path:
+                    # Responder con el archivo de audio generado
+                    voice_response = VoiceResponse()
+                    audio_url = request.url_root + response_audio_path
+                    voice_response.play(audio_url)
+
+                    # Volver a grabar para el próximo mensaje
+                    voice_response.record(action="/process-recording", method="POST")
+                    return str(voice_response)
+                else:
+                    print("Error al generar el audio de respuesta.")
+                    return "Error al generar el audio de respuesta.", 500
+            else:
+                print("No se pudo transcribir el audio.")
+                return "No se pudo transcribir el audio.", 500
+        else:
+            print(f"Error al descargar el audio grabado. Código de estado: {response.status_code}")
+            return "Error al descargar el audio grabado.", 500
+    else:
+        print("No se recibió el RecordingUrl. Verifica la configuración en Twilio.")
+        return "No se recibió el RecordingUrl. Verifica la configuración en Twilio.", 400
+
+if __name__ == "__main__":
+    app.run(port=5001)
+

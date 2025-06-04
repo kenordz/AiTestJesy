@@ -1,0 +1,148 @@
+# jesy_ai/app.py
+import os
+import json
+import base64
+import threading
+import queue
+import logging
+import uvicorn
+import asyncio
+
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi.responses import FileResponse
+
+from config import STATIC_AUDIO_PATH, STATIC_MESSAGES, ERROR_AUDIO_PATH
+from tts import generate_audio_file_static
+from stt import process_audio
+from twilio_integration import play_audio_to_caller
+
+logger = logging.getLogger(__name__)
+
+app = FastAPI()
+
+@app.get("/")
+def read_root():
+    return {"message": "Hello, World!"}
+
+@app.on_event("startup")
+async def startup_event():
+    # Comenta la llamada a generate_static_audio() temporalmente
+    # asyncio.create_task(generate_static_audio())
+    pass
+
+async def generate_static_audio():
+    """
+    Genera audios estáticos (welcome, wait, error, etc.) si no existen.
+    """
+    if not os.path.exists(STATIC_AUDIO_PATH):
+        os.makedirs(STATIC_AUDIO_PATH)
+
+    # Generar audios para cada mensaje estático
+    for key, text in STATIC_MESSAGES.items():
+        if key == 'wait':
+            for idx, phrase in enumerate(text):
+                audio_filename = f"{key}_{idx}.mp3"
+                audio_path = os.path.join(STATIC_AUDIO_PATH, audio_filename)
+                if not os.path.exists(audio_path):
+                    logger.info(f"Generando audio estático: {audio_path}")
+                    await generate_audio_file_static(phrase, audio_path)
+                else:
+                    logger.info(f"Audio estático ya existe: {audio_path}")
+        else:
+            audio_filename = f"{key}.mp3"
+            audio_path = os.path.join(STATIC_AUDIO_PATH, audio_filename)
+            if not os.path.exists(audio_path):
+                logger.info(f"Generando audio estático: {audio_path}")
+                await generate_audio_file_static(text, audio_path)
+            else:
+                logger.info(f"Audio estático ya existe: {audio_path}")
+
+    # Verificar existencia de goodbye.mp3
+    goodbye_audio_path = os.path.join(STATIC_AUDIO_PATH, "goodbye.mp3")
+    if not os.path.exists(goodbye_audio_path):
+        logger.warning("No existe goodbye.mp3; no se podrá reproducir despedida.")
+    else:
+        logger.info("Archivo goodbye.mp3 disponible.")
+
+@app.get("/static/{filename}")
+async def serve_static(filename: str):
+    return FileResponse(path=os.path.join(STATIC_AUDIO_PATH, filename))
+
+@app.websocket("/media")
+async def media_socket(websocket: WebSocket):
+    logger.info("Conexión WebSocket /media establecida con Twilio.")
+    await websocket.accept()
+
+    audio_queue = queue.Queue()
+    stop_event = threading.Event()
+    call_context = {
+        "call_sid": None,
+        "conversation_history": [
+            {
+                "role": "system",
+                "content": (
+                    "You are Jessica, a customer service representative for NetConnect Internet Services. "
+                    "You help with billing, technical support, and general information. "
+                    "You are friendly, but always follow business guidelines."
+                ),
+            }
+        ],
+    }
+
+    # Iniciar hilo para procesar audio en tiempo real
+    threading.Thread(
+        target=process_audio,
+        args=(audio_queue, stop_event, call_context),
+        daemon=True
+    ).start()
+
+    try:
+        while not stop_event.is_set():
+            try:
+                message = await websocket.receive_text()
+                if message is None:
+                    logger.info("WebSocket cerrado por el cliente.")
+                    break
+                data = json.loads(message)
+                event = data.get("event", "")
+                logger.debug(f"Evento WebSocket: {event}")
+
+                if event == "start":
+                    call_context["call_sid"] = data["start"]["callSid"]
+                    logger.info(f"Call SID recibido: {call_context['call_sid']}")
+                    # Reproducir welcome.mp3
+                    welcome_path = os.path.join(STATIC_AUDIO_PATH, "welcome.mp3")
+                    if os.path.exists(welcome_path):
+                        play_audio_to_caller(call_context["call_sid"], welcome_path)
+                    else:
+                        logger.error("No se encontró welcome.mp3.")
+
+                elif event == "media":
+                    payload = data["media"]["payload"]
+                    audio_content = base64.b64decode(payload)
+                    audio_queue.put(audio_content)
+                    logger.debug(f"Audio recibido: {len(audio_content)} bytes")
+
+                elif event == "stop":
+                    logger.info("Evento 'stop' recibido. Cerrando WebSocket.")
+                    stop_event.set()
+                    break
+                else:
+                    logger.warning(f"Evento no manejado: {event}")
+            except Exception as e:
+                logger.error(f"Excepción en WebSocket: {e}", exc_info=True)
+                break
+    except WebSocketDisconnect:
+        logger.info("WebSocket desconectado por el cliente.")
+    finally:
+        stop_event.set()
+        await websocket.close()
+        logger.info("WebSocket /media cerrado al final.")
+
+if __name__ == "__main__":
+    try:
+        port = int(os.getenv("PORT", 8080))
+        logger.info(f"Iniciando servidor en el puerto {port}...")
+        uvicorn.run(app, host="0.0.0.0", port=port)
+    except Exception as e:
+        logger.error(f"Error General: {str(e)}", exc_info=True)

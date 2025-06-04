@@ -1,0 +1,355 @@
+{
+  "MenuSuperSalads": {
+    "Healthy Bakery": [
+      {
+        "nombre": "Gansito Keto Red Velvet",
+        "precio": "$64",
+        "caracteristicas": ["Keto"]
+      },
+      {
+        "nombre": "Red Velvet Cookie",
+        "precio": "$39",
+        "caracteristicas": ["Keto", "Sugar Free", "Gluten Free"]
+      },
+      {
+        "nombre": "Pingüino Keto",
+        "precio": "$64",
+        "caracteristicas": ["Keto"]
+      },
+      {
+        "nombre": "Choco Roles Sugar Free",
+        "precio": "$64",
+        "caracteristicas": ["Sugar Free"]
+      },
+      {
+        "nombre": "Muffin Zanahoria Keto",
+        "precio": "$64",
+        "caracteristicas": ["Keto"]
+      },
+      {
+        "nombre": "Mamut Keto",
+        "precio": "$64",
+        "caracteristicas": ["Keto"]
+      },
+      {
+        "nombre": "Brownie Gluten Free",
+        "precio": "$64",
+        "caracteristicas": ["Gluten Free"]
+      }
+    ],
+    "Mix & Match": {
+      "descripcion": "Crea tu combo saludable combinando sopas, ensaladas, sándwiches y bowls.",
+      "ejemplos_opciones": [
+        "Sopa",
+        "Media ensalada + sopa",
+        "Medio grain bowl + sopa",
+        "Panini + sopa",
+        "Torta + sopa"
+      ]
+    },
+    "Start & Share": [
+      {
+        "nombre": "Coliflores Buffalo",
+        "precio": "$119"
+      }
+    ],
+    "Sopas y Cremas": [
+      {
+        "nombre": "Sopa de Tortilla",
+        "precio": "$79"
+      },
+      {
+        "nombre": "Crema de Brócoli",
+        "precio": "$79"
+      },
+      {
+        "nombre": "Crema de Elote",
+        "precio": "$79"
+      },
+      {
+        "nombre": "Caldo Tlalpeño",
+        "precio": "$79",
+        "extra_opcional": {
+          "nombre": "Fideo integral",
+          "costo": "$10"
+        }
+      },
+      {
+        "nombre": "Sopa de Lentejas",
+        "precio": "$79"
+      }
+    ],
+    "Ensaladas": [
+      {
+        "nombre": "Santa Fe",
+        "precio": "$154"
+      },
+      {
+        "nombre": "Santa Fe Spicy",
+        "precio": "$164"
+      },
+      {
+        "nombre": "Capri Paradiso",
+        "precio": "$174"
+      },
+      {
+        "nombre": "César Pollo",
+        "precio": "$154"
+      },
+      {
+        "nombre": "Quinoa Chicken Grill",
+        "precio": "$174"
+      },
+      {
+        "nombre": "Buffalo Tender",
+        "precio": "$174"
+      },
+      {
+        "nombre": "Hawaiian Citric",
+        "precio": "$174"
+      },
+      {
+        "nombre": "Chicken & Veggie",
+        "precio": "$179"
+      },
+      {
+        "nombre": "Pasta con Atún",
+        "precio": "$194"
+      },
+      {
+        "nombre": "César Spicy",
+        "precio": "$189"
+      },
+      {
+        "nombre": "California Spicy",
+        "precio": "$189"
+      }
+    ],
+    "Grain Bowls": [
+      {
+        "nombre": "Country Chicken Bowl",
+        "precios": ["$199", "$209", "$219"]
+      },
+      {
+        "nombre": "Teriyaki Chicken Bowl",
+        "precios": ["$199", "$209", "$219"]
+      },
+      {
+        "nombre": "Oriental Chicken Bowl",
+        "precios": ["$199", "$209", "$219"]
+      },
+      {
+        "nombre": "Louisiana Chicken Bowl",
+        "precios": ["$199", "$209", "$219"]
+      },
+      {
+        "nombre": "Mediterranean Chicken Bowl",
+        "precios": ["$199", "$209", "$219"]
+      },
+      {
+        "nombre": "Buffalo Chicken Bowl",
+        "precios": ["$199", "$209", "$219"]
+      },
+      {
+        "nombre": "Veggie Roast Bowl",
+        "precios": ["$199", "$209", "$219"]
+      },
+      {
+        "nombre": "TexMex Bowl",
+        "precios": ["$214", "$224", "$229"]
+      }
+    ],
+    "Sandwiches": [
+      {
+        "nombre": "Louisiana",
+        "precios": {
+          "individual": "$124",
+          "combo_sopa": "$169",
+          "combo_ensalada": "$179"
+        }
+      },
+      {
+        "nombre": "Chicken Swiss",
+        "precios": {
+          "individual": "$124",
+          "combo_sopa": "$169",
+          "combo_ensalada": "$179"
+        }
+      },
+      {
+        "nombre": "Roast Beef (Handcrafted)",
+        "precios": {
+          "individual": "$209",
+          "combo_sopa": "$239",
+          "combo_ensalada": "$249",
+          "combo_grain_bowl": "$259"
+        }
+      },
+      {
+        "nombre": "Grilled Chicken Pomodoro (Handcrafted)",
+        "precios": {
+          "individual": "$179",
+          "combo_sopa": "$199",
+          "combo_ensalada": "$209"
+        }
+      },
+      {
+        "nombre": "Spicy Club (Handcrafted)",
+        "precios": {
+          "individual": "$179",
+          "combo_sopa": "$199",
+          "combo_ensalada": "$209"
+        }
+      }
+    ],
+    "Tortas": [
+      {
+        "nombre": "Buffalo Chicken Crisp",
+        "precios": {
+          "individual": "$139",
+          "combo_sopa": "$169",
+          "combo_ensalada": "$179"
+        }
+      },
+      {
+        "nombre": "Bacon Chicken",
+        "precios": {
+          "individual": "$139",
+          "combo_sopa": "$169",
+          "combo_ensalada": "$179"
+        }
+      },
+      {
+        "nombre": "Mexicana",
+        "precios": {
+          "individual": "$139",
+          "combo_sopa": "$169",
+          "combo_ensalada": "$179"
+        }
+      },
+      {
+        "nombre": "Arrachera Cheesesteak",
+        "precios": {
+          "individual": "$199",
+          "combo_sopa": "$219",
+          "combo_ensalada": "$239",
+          "combo_grain_bowl": "$254"
+        }
+      },
+      {
+        "nombre": "Roast Beef Cheese",
+        "precios": {
+          "individual": "$199",
+          "combo_sopa": "$224",
+          "combo_ensalada": "$239",
+          "combo_grain_bowl": "$254"
+        }
+      }
+    ],
+    "Paninis": [
+      {
+        "nombre": "Palermo",
+        "precios": {
+          "individual": "$139",
+          "combo_sopa": "$174",
+          "combo_ensalada": "$184"
+        }
+      },
+      {
+        "nombre": "Chicken Venezia",
+        "precios": {
+          "individual": "$139",
+          "combo_sopa": "$174",
+          "combo_ensalada": "$184"
+        }
+      },
+      {
+        "nombre": "Chicken Bari",
+        "precios": {
+          "individual": "$139",
+          "combo_sopa": "$174",
+          "combo_ensalada": "$184"
+        }
+      }
+    ],
+    "Pitas": [
+      {
+        "nombre": "Mediterranean Spicy",
+        "precios": {
+          "individual": "$144",
+          "combo_sopa": "$184",
+          "combo_ensalada": "$194"
+        }
+      },
+      {
+        "nombre": "Buffalo Bacon",
+        "precios": {
+          "individual": "$144",
+          "combo_sopa": "$184",
+          "combo_ensalada": "$194"
+        }
+      },
+      {
+        "nombre": "Pireo Cilantro Steak",
+        "precios": {
+          "individual": "$159",
+          "combo_sopa": "$199",
+          "combo_ensalada": "$209"
+        }
+      }
+    ],
+    "Healthy Burgers": [
+      {
+        "nombre": "Clásica (Classic Burger)",
+        "precios": {
+          "individual": "$139",
+          "combo_sopa": "$174",
+          "combo_ensalada": "$189"
+        }
+      },
+      {
+        "nombre": "Spicy Buffalo",
+        "precios": {
+          "individual": "$139",
+          "combo_sopa": "$174",
+          "combo_ensalada": "$189"
+        }
+      },
+      {
+        "nombre": "Grilled Chicken",
+        "precios": {
+          "individual": "$139",
+          "combo_sopa": "$174",
+          "combo_ensalada": "$189"
+        }
+      },
+      {
+        "nombre": "Beyond® Burger (Nuevo)",
+        "precios": {
+          "individual": "$174",
+          "combo_sopa": "$204",
+          "combo_ensalada": "$209",
+          "combo_grain_bowl": "$229"
+        }
+      }
+    ],
+    "Bebidas": {
+      "Aguas Frescas Natural Bits": {
+        "precio": "$59"
+      },
+      "Aguas Frescas Clásicas": {
+        "precio": "$49"
+      },
+      "Refrescos en Botella (600 ml)": {
+        "precio": "$45"
+      },
+      "Agua Embotellada (500 ml)": {
+        "precio": "$39"
+      }
+    },
+    "Menú Infantil": {
+      "precio": "$99"
+    }
+  }
+}
+

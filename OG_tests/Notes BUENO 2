@@ -1,0 +1,314 @@
+import os
+import sys
+import json
+import base64
+import threading
+import queue
+import time
+import asyncio
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi.responses import FileResponse
+from dotenv import load_dotenv
+import httpx
+import openai
+from google.cloud import speech
+from twilio.rest import Client
+from twilio.twiml.voice_response import VoiceResponse
+import uvicorn
+import logging
+
+# Configuración de logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+# Cargar variables de entorno desde el archivo .env
+load_dotenv()
+
+# Configurar credenciales
+required_env_vars = [
+    "GOOGLE_APPLICATION_CREDENTIALS",
+    "ELEVENLABS_API_KEY",
+    "VOICE_ID",
+    "TWILIO_ACCOUNT_SID",
+    "TWILIO_AUTH_TOKEN",
+    "OPENAI_API_KEY",
+    "NGROK_URL",
+    "TWIML_BIN_URL",
+]
+
+missing_vars = [var for var in required_env_vars if not os.getenv(var)]
+if missing_vars:
+    logger.error(
+        f"Las siguientes variables de entorno no están configuradas correctamente: {', '.join(missing_vars)}"
+    )
+    sys.exit(1)
+
+os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = os.getenv("GOOGLE_APPLICATION_CREDENTIALS")
+ELEVENLABS_API_KEY = os.getenv("ELEVENLABS_API_KEY")
+VOICE_ID = os.getenv("VOICE_ID")
+TWILIO_ACCOUNT_SID = os.getenv("TWILIO_ACCOUNT_SID")
+TWILIO_AUTH_TOKEN = os.getenv("TWILIO_AUTH_TOKEN")
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+NGROK_URL = os.getenv("NGROK_URL").rstrip('/')
+TWIML_BIN_URL = os.getenv("TWIML_BIN_URL")
+
+openai.api_key = OPENAI_API_KEY
+
+app = FastAPI()
+twilio_client = Client(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
+
+# Función para validar llamadas activas
+def is_call_active(call_sid):
+    try:
+        call = twilio_client.calls(call_sid).fetch()
+        logger.debug(f"Estado de la llamada: {call.status}")
+        return call.status in ["in-progress", "ringing"]
+    except Exception as e:
+        logger.error(f"Verificando estado de la llamada: {e}")
+        return False
+
+# Función para procesar respuestas en tiempo real
+def process_audio(audio_queue, stop_event, call_sid_container):
+    try:
+        speech_client = speech.SpeechClient()
+        recognition_config = speech.RecognitionConfig(
+            encoding=speech.RecognitionConfig.AudioEncoding.MULAW,
+            sample_rate_hertz=8000,
+            language_code="en-US",
+            enable_automatic_punctuation=True,
+            max_alternatives=1,
+        )
+        streaming_config = speech.StreamingRecognitionConfig(
+            config=recognition_config, interim_results=False, single_utterance=False
+        )
+
+        def audio_generator():
+            buffer = bytearray()
+            last_audio_time = time.time()
+            while not stop_event.is_set():
+                try:
+                    audio_content = audio_queue.get(timeout=0.005)
+                    buffer.extend(audio_content)
+                    last_audio_time = time.time()
+                    if len(buffer) >= 320:  # Enviar cada 20ms de audio
+                        yield speech.StreamingRecognizeRequest(audio_content=bytes(buffer))
+                        logger.debug(f"Audio enviado al reconocedor: {len(buffer)} bytes")
+                        buffer = bytearray()
+                except queue.Empty:
+                    if (time.time() - last_audio_time) >= 0.03:
+                        # Enviar silencio si no hay audio
+                        logger.info("Enviando silencio para mantener la conexión.")
+                        silence = b"\xFF" * 320  # 20ms de silencio en PCM mu-law
+                        yield speech.StreamingRecognizeRequest(audio_content=silence)
+                        last_audio_time = time.time()
+
+        requests_generator = audio_generator()
+        responses = speech_client.streaming_recognize(streaming_config, requests_generator)
+
+        # Crear una tarea asincrónica para manejar las respuestas
+        asyncio.run(handle_responses_async(responses, call_sid_container, stop_event))
+    except Exception as e:
+        logger.error(f"Procesando audio en tiempo real: {e}")
+
+# Función asincrónica para manejar las respuestas del reconocedor de voz
+async def handle_responses_async(responses, call_sid_container, stop_event):
+    try:
+        for response in responses:
+            if not response.results:
+                continue
+            for result in response.results:
+                if result.is_final:
+                    transcript = result.alternatives[0].transcript.strip()
+                    if not transcript:
+                        logger.warning("Transcripción vacía. Enviando respuesta genérica.")
+                        transcript = "I couldn't hear you. Can you please repeat?"
+                    logger.info(f"Transcripción Final: {transcript}")
+
+                    # Iniciar tareas asincrónicas para generar respuesta y audio
+                    openai_task = asyncio.create_task(get_openai_response_async(transcript))
+                    openai_response = await openai_task
+
+                    audio_task = asyncio.create_task(generate_audio_async(openai_response))
+                    response_audio_path = await audio_task
+
+                    # Reproducir el audio si fue generado correctamente
+                    if response_audio_path:
+                        play_audio_to_caller(call_sid_container["call_sid"], response_audio_path)
+                    else:
+                        logger.error("No se pudo generar audio.")
+
+                    # Salir del bucle si el evento de parada está establecido
+                    if stop_event.is_set():
+                        break
+    except Exception as e:
+        logger.error(f"Manejo de respuestas asincrónicas: {e}")
+
+# Función asincrónica para obtener respuesta de OpenAI
+async def get_openai_response_async(prompt):
+    try:
+        logger.info(f"Generando respuesta con OpenAI para el prompt: {prompt}")
+        loop = asyncio.get_event_loop()
+        start_time = time.time()
+        response = await loop.run_in_executor(
+            None,
+            lambda: openai.ChatCompletion.create(
+                model="gpt-3.5-turbo",
+                messages=[
+                    {"role": "system", "content": "You are Mónica, an assistant for NetConnect Services."},
+                    {"role": "user", "content": prompt},
+                ],
+            ),
+        )
+        end_time = time.time()
+        logger.info(f"Tiempo en obtener respuesta de OpenAI: {end_time - start_time:.2f} segundos")
+        answer = response["choices"][0]["message"]["content"].strip()
+        if not answer:
+            logger.error("Respuesta de OpenAI vacía.")
+            return "I'm sorry, I couldn't process your request."
+        logger.info(f"Respuesta generada por OpenAI: {answer}")
+        return answer
+    except Exception as e:
+        logger.error(f"Generando respuesta con OpenAI: {e}")
+        return "I'm sorry, I couldn't process your request."
+
+# Función asincrónica para generar audio con Eleven Labs
+async def generate_audio_async(text):
+    try:
+        if not text:
+            logger.error("Texto para generar audio está vacío.")
+            return None
+        logger.info(f"Generando audio con Eleven Labs para el texto: {text}")
+        url = f"https://api.elevenlabs.io/v1/text-to-speech/{VOICE_ID}"
+        headers = {
+            "Accept": "audio/mpeg",
+            "Content-Type": "application/json",
+            "xi-api-key": ELEVENLABS_API_KEY,
+        }
+        data = {"text": text, "voice_settings": {"stability": 0.7, "similarity_boost": 0.75}}
+
+        async with httpx.AsyncClient() as client:
+            start_time = time.time()
+            response = await client.post(url, json=data, headers=headers)
+            end_time = time.time()
+            logger.info(f"Tiempo en generar audio con Eleven Labs: {end_time - start_time:.2f} segundos")
+
+            if response.status_code == 200:
+                if not os.path.exists("static"):
+                    os.makedirs("static")
+                timestamp = int(time.time())
+                audio_filename = f"Response_{timestamp}.mp3"
+                audio_path = os.path.join("static", audio_filename)
+                with open(audio_path, "wb") as f:
+                    f.write(response.content)
+                logger.info(f"Audio generado y guardado: {audio_path}")
+
+                # Verificar que el archivo es accesible
+                audio_url = f"https://{NGROK_URL}/static/{audio_filename}"
+                resp = await client.get(audio_url)
+                if resp.status_code != 200:
+                    logger.error(f"El archivo de audio no es accesible desde la URL: {audio_url}")
+                    return None
+                else:
+                    logger.debug("El archivo de audio es accesible desde la URL.")
+                return audio_path
+            else:
+                logger.error(f"Eleven Labs falló: {response.text}")
+                return None
+    except Exception as e:
+        logger.error(f"Generando audio asincrónicamente: {e}")
+        return None
+
+# Reproducir respuesta al usuario
+def play_audio_to_caller(call_sid, audio_path):
+    try:
+        if not call_sid:
+            logger.error("call_sid es None, no se puede reproducir el audio.")
+            return
+
+        # Verificar y registrar el estado de la llamada
+        if not is_call_active(call_sid):
+            logger.error("La llamada no está activa, no se puede reproducir el audio.")
+            return
+
+        # Verificar si el archivo de audio existe
+        if not os.path.exists(audio_path):
+            logger.error(f"El archivo de audio no existe: {audio_path}")
+            return
+
+        # Construir la URL del archivo de audio
+        audio_url = f"https://{NGROK_URL}/static/{os.path.basename(audio_path)}"
+        logger.info(f"URL del audio: {audio_url}")
+
+        # Crear TwiML para reproducir el audio y mantener la llamada activa
+        response = VoiceResponse()
+        response.play(audio_url)
+        response.pause(length=60)  # Mantener la llamada activa después de reproducir el audio
+        response.redirect(TWIML_BIN_URL)  # Reiniciar el flujo de medios
+        logger.debug(f"TwiML generado: {str(response)}")
+
+        # Actualizar la llamada con TwiML
+        twilio_client.calls(call_sid).update(twiml=str(response))
+        logger.info("Audio reproducido correctamente al llamante.")
+    except Exception as e:
+        logger.error(f"Reproduciendo audio: {e}")
+
+# Ruta para servir archivos estáticos
+@app.get("/static/{filename}")
+async def serve_static(filename: str):
+    return FileResponse(path=f"static/{filename}")
+
+# WebSocket para Twilio Streaming
+@app.websocket("/media")
+async def media_socket(websocket: WebSocket):
+    logger.info("Conexión WebSocket establecida.")
+    await websocket.accept()
+    audio_queue = queue.Queue()
+    stop_event = threading.Event()
+    call_sid_container = {"call_sid": None}
+
+    # Iniciar el hilo de procesamiento de audio
+    threading.Thread(
+        target=process_audio, args=(audio_queue, stop_event, call_sid_container), daemon=True
+    ).start()
+
+    try:
+        while not stop_event.is_set():
+            try:
+                message = await websocket.receive_text()
+                if message is None:
+                    logger.info("Conexión WebSocket cerrada por el cliente.")
+                    break
+                event_data = json.loads(message)
+                event = event_data.get("event", "")
+                logger.debug(f"Evento recibido: {event}")
+
+                if event == "start":
+                    call_sid_container["call_sid"] = event_data["start"]["callSid"]
+                    logger.info(f"Call SID recibido: {call_sid_container['call_sid']}")
+                elif event == "media":
+                    payload = event_data["media"]["payload"]
+                    audio_content = base64.b64decode(payload)
+                    audio_queue.put(audio_content)
+                    logger.debug(f"Audio recibido y agregado a la cola: {len(audio_content)} bytes")
+                elif event == "stop":
+                    logger.info("Evento 'stop' recibido. Cerrando conexión.")
+                    stop_event.set()  # Asegurar que el hilo de audio se detenga
+                    break
+                else:
+                    logger.warning(f"Evento no manejado: {event}")
+            except Exception as e:
+                logger.error(f"En WebSocket: {e}")
+                break
+    except WebSocketDisconnect:
+        logger.info("WebSocket desconectado.")
+    finally:
+        stop_event.set()
+        await websocket.close()
+        logger.info("WebSocket cerrado.")
+
+if __name__ == "__main__":
+    try:
+        logger.info("Iniciando servidor...")
+        uvicorn.run(app, host="0.0.0.0", port=5001)
+    except Exception as e:
+        logger.error(f"Error General: {str(e)}")

@@ -1,0 +1,679 @@
+import os
+import sys
+import json
+import base64
+import threading
+import queue
+import time
+import random
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi.responses import FileResponse
+from dotenv import load_dotenv
+import httpx
+import openai
+from google.cloud import speech
+from twilio.rest import Client
+from twilio.twiml.voice_response import VoiceResponse
+import uvicorn
+import logging
+from pydub import AudioSegment
+import string
+
+# Configuración de logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+# Cargar variables de entorno desde .env
+load_dotenv()
+
+# Validar variables obligatorias
+required_env_vars = [
+    "ELEVENLABS_API_KEY",
+    "VOICE_ID",
+    "TWILIO_ACCOUNT_SID",
+    "TWILIO_AUTH_TOKEN",
+    "OPENAI_API_KEY",
+    "TWIML_BIN_URL",
+]
+missing_vars = [var for var in required_env_vars if not os.getenv(var)]
+if missing_vars:
+    logger.error(f"Faltan variables de entorno: {', '.join(missing_vars)}")
+    sys.exit(1)
+
+ELEVENLABS_API_KEY = os.getenv("ELEVENLABS_API_KEY")
+VOICE_ID = os.getenv("VOICE_ID")
+TWILIO_ACCOUNT_SID = os.getenv("TWILIO_ACCOUNT_SID")
+TWILIO_AUTH_TOKEN = os.getenv("TWILIO_AUTH_TOKEN")
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+TWIML_BIN_URL = os.getenv("TWIML_BIN_URL")
+
+# URL pública de Cloud Run
+BASE_URL = os.getenv("PUBLIC_BASE_URL", "https://ai-test-app-97012651308.us-central1.run.app")
+
+openai.api_key = OPENAI_API_KEY
+
+app = FastAPI()
+twilio_client = Client(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
+
+# Parámetros Eleven Labs
+ELEVENLABS_STABILITY = 0.1
+ELEVENLABS_SIMILARITY_BOOST = 0.9
+MAX_CHAR_LIMIT = 300
+MAX_RETRIES = 3
+
+STATIC_AUDIO_PATH = "static"
+ERROR_AUDIO_PATH = os.path.join(STATIC_AUDIO_PATH, "error.mp3")
+
+# Mensajes estáticos
+STATIC_MESSAGES = {
+    "welcome": "Thank you for connecting to NetConnect Services, how can I help you today?",
+    "wait": [
+        "Ok, give me one second, please.",
+        "Ok, one moment, please.",
+        "Hold on, please.",
+        "Just a moment, please.",
+        "Alright, let me check that for you, one second."
+    ],
+    "error": "We are experiencing technical difficulties. Please try again later.",
+}
+
+# Frases de despedida
+farewell_phrases = [
+    "goodbye",
+    "bye",
+    "see you",
+    "thank you very much",
+    "that's all i needed"
+]
+
+# **NUEVO**: quick_intents (mini-árbol). Pueden ser preguntas comunes
+# “key” => lower string sin puntuación, “value” => respuesta inmediata
+QUICK_INTENTS = {
+    "hi my name is alex can you help me": "Hello Alex! Absolutely, I'm here to help. What can I do for you today?",
+    "what is your name": "I am Jessica, your AI assistant from NetConnect Services.",
+    "are you a real person": "I'm a virtual AI assistant, but I'll do my best to assist you like a real agent.",
+    "how do i pay my bill": "You can pay your NetConnect bill online or call our billing department. Let me give you more details..."
+    # Agrega más casos si quieres
+}
+
+def split_text(text, max_length):
+    """
+    Divide el texto en chunks <= max_length (en caracteres).
+    """
+    words = text.split()
+    chunks = []
+    current_chunk = ""
+
+    for word in words:
+        if len(current_chunk) + len(word) + 1 <= max_length:
+            current_chunk += (" " + word) if current_chunk else word
+        else:
+            chunks.append(current_chunk.strip())
+            current_chunk = word
+    if current_chunk:
+        chunks.append(current_chunk.strip())
+
+    return chunks
+
+
+@app.get("/")
+def read_root():
+    return {"message": "Hello, World!"}
+
+
+# -------------- GENERAR AUDIOS ESTÁTICOS AL INICIO -------------- #
+
+@app.on_event("startup")
+async def startup_event():
+    await generate_static_audio()
+
+async def generate_static_audio():
+    """
+    Genera audios estáticos (welcome, wait, error, etc.) si no existen.
+    """
+    if not os.path.exists(STATIC_AUDIO_PATH):
+        os.makedirs(STATIC_AUDIO_PATH)
+
+    for key, text in STATIC_MESSAGES.items():
+        if key == 'wait':
+            for idx, phrase in enumerate(text):
+                audio_filename = f"{key}_{idx}.mp3"
+                audio_path = os.path.join(STATIC_AUDIO_PATH, audio_filename)
+                if not os.path.exists(audio_path):
+                    logger.info(f"Generando audio estático: {audio_path}")
+                    await generate_audio_file_static(phrase, audio_path)
+                else:
+                    logger.info(f"Audio estático ya existe: {audio_path}")
+        else:
+            audio_filename = f"{key}.mp3"
+            audio_path = os.path.join(STATIC_AUDIO_PATH, audio_filename)
+            if not os.path.exists(audio_path):
+                logger.info(f"Generando audio estático: {audio_path}")
+                await generate_audio_file_static(text, audio_path)
+            else:
+                logger.info(f"Audio estático ya existe: {audio_path}")
+
+    # goodbye.mp3
+    goodbye_audio_path = os.path.join(STATIC_AUDIO_PATH, "goodbye.mp3")
+    if not os.path.exists(goodbye_audio_path):
+        logger.warning("No existe goodbye.mp3; no se podrá reproducir despedida.")
+    else:
+        logger.info("Archivo goodbye.mp3 disponible.")
+
+async def generate_audio_file_static(text, audio_path):
+    logger.info(f"Generando audio estático para: {text}")
+    final_path = await generate_audio_async(text, audio_path)
+    if final_path:
+        logger.info(f"Audio estático guardado: {final_path}")
+    else:
+        logger.error("No se pudo generar audio estático.")
+
+
+# ---------------- HILO PARA PROCESAR AUDIO EN TIEMPO REAL ---------------- #
+
+def process_audio(audio_queue, stop_event, call_context):
+    """
+    Hilo que hace streaming con Google STT (síncrono).
+    """
+    try:
+        if "GOOGLE_APPLICATION_CREDENTIALS" in os.environ:
+            logger.warning("Removiendo GOOGLE_APPLICATION_CREDENTIALS a la fuerza...")
+            del os.environ["GOOGLE_APPLICATION_CREDENTIALS"]
+
+        logger.info("Inicializando cliente de Google Speech-to-Text (sync).")
+        speech_client = speech.SpeechClient()
+
+        recognition_config = speech.RecognitionConfig(
+            encoding=speech.RecognitionConfig.AudioEncoding.MULAW,
+            sample_rate_hertz=8000,
+            language_code="en-US",
+            enable_automatic_punctuation=True,
+            max_alternatives=1,
+            speech_contexts=[speech.SpeechContext(phrases=[], boost=15.0)],
+        )
+        streaming_config = speech.StreamingRecognitionConfig(
+            config=recognition_config,
+            interim_results=False,
+            single_utterance=False,
+        )
+
+        def audio_generator():
+            buffer = bytearray()
+            last_audio_time = time.time()
+            while not stop_event.is_set():
+                try:
+                    audio_content = audio_queue.get(timeout=0.005)
+                    buffer.extend(audio_content)
+                    last_audio_time = time.time()
+                    if len(buffer) >= 320:
+                        yield speech.StreamingRecognizeRequest(audio_content=bytes(buffer))
+                        buffer = bytearray()
+                except queue.Empty:
+                    if (time.time() - last_audio_time) >= 0.03:
+                        logger.debug("Enviando silencio a STT.")
+                        silence = b"\xFF" * 320
+                        yield speech.StreamingRecognizeRequest(audio_content=silence)
+                        last_audio_time = time.time()
+
+        requests_generator = audio_generator()
+        logger.info("Iniciando streaming_recognize con Google STT...")
+        responses = speech_client.streaming_recognize(streaming_config, requests_generator)
+        logger.info("STT iniciado; manejamos respuestas sync.")
+        handle_responses_sync(responses, call_context, stop_event)
+
+    except Exception as e:
+        logger.error(f"Error procesando audio: {e}", exc_info=True)
+
+
+def handle_responses_sync(responses, call_context, stop_event):
+    """
+    Maneja las respuestas de STT con un for normal. 
+    Añadimos el 'mini-árbol' y 'filler' para GPT.
+    """
+    try:
+        wait_message_sent = False
+        for response in responses:
+            if not response.results:
+                continue
+            for result in response.results:
+                if result.is_final:
+                    transcript = result.alternatives[0].transcript.strip()
+                    logger.info(f"Transcripción final: {transcript}")
+
+                    # 1) Check irrelevante / short
+                    if len(transcript) < 3:
+                        logger.info("Transcripción muy corta. Ignoramos.")
+                        continue
+                    if is_irrelevant(transcript):
+                        logger.info("Transcripción irrelevante.")
+                        continue
+
+                    # 2) Check despedida
+                    if is_farewell(transcript):
+                        logger.info("Despedida detectada.")
+                        goodbye_path = os.path.join(STATIC_AUDIO_PATH, "goodbye.mp3")
+                        if os.path.exists(goodbye_path):
+                            play_audio_to_caller(call_context["call_sid"], goodbye_path)
+                        else:
+                            logger.warning("No se encontró goodbye.mp3")
+                        stop_event.set()
+                        break
+
+                    # 3) Check quick intent (mini-árbol)
+                    quick_answer = check_quick_intent(transcript)
+                    if quick_answer is not None:
+                        logger.info(f"INTENT match => Respuesta instantánea: {quick_answer}")
+                        # Genera TTS rápido
+                        quick_audio = generate_audio_sync(quick_answer)
+                        if quick_audio:
+                            play_audio_to_caller(call_context["call_sid"], quick_audio)
+                        else:
+                            # fallback a error
+                            logger.error("No se pudo generar audio quick_intent.")
+                            if os.path.exists(ERROR_AUDIO_PATH):
+                                play_audio_to_caller(call_context["call_sid"], ERROR_AUDIO_PATH)
+                        continue  # No llamamos a GPT
+
+                    # 4) Lógica normal con GPT
+                    # Reproducimos filler audio (si no se envió ya) 
+                    if not wait_message_sent:
+                        filler_text = random.choice(STATIC_MESSAGES['wait'])
+                        filler_audio = generate_audio_sync(filler_text)
+                        if filler_audio:
+                            play_audio_to_caller(call_context["call_sid"], filler_audio)
+                        else:
+                            logger.warning("No filler audio MP3. Revisar static/wait_X.mp3")
+                        wait_message_sent = True
+
+                    # Agregar al historial
+                    call_context["conversation_history"].append({"role": "user", "content": transcript})
+                    call_context["conversation_history"] = trim_conversation_history_sync(call_context["conversation_history"])
+
+                    # Llamar a GPT
+                    logger.info("Llamando a OpenAI GPT...")
+                    gpt_resp = get_openai_response_sync(call_context["conversation_history"])
+                    logger.info(f"Respuesta GPT: {gpt_resp}")
+
+                    # Añadir al historial
+                    call_context["conversation_history"].append({"role": "assistant", "content": gpt_resp})
+
+                    # TTS de la respuesta GPT
+                    audio_gpt = generate_audio_sync(gpt_resp)
+                    if audio_gpt:
+                        play_audio_to_caller(call_context["call_sid"], audio_gpt)
+                    else:
+                        logger.error("No se pudo generar audio de GPT.")
+                        if os.path.exists(ERROR_AUDIO_PATH):
+                            play_audio_to_caller(call_context["call_sid"], ERROR_AUDIO_PATH)
+
+                    wait_message_sent = False
+
+                    if stop_event.is_set():
+                        break
+            if stop_event.is_set():
+                break
+    except Exception as e:
+        logger.error(f"Error en handle_responses_sync: {e}", exc_info=True)
+
+
+# ----------------- MINI-ÁRBOL: QUICK INTENTS ------------------ #
+def check_quick_intent(transcript: str):
+    """
+    Compara la transcripción con QUICK_INTENTS. Si coincide, regresa la respuesta. 
+    Si no, None.
+    """
+    norm = transcript.lower().translate(str.maketrans('', '', string.punctuation))
+    norm = " ".join(norm.split())  # quita espacios extra
+    if norm in QUICK_INTENTS:
+        return QUICK_INTENTS[norm]
+    return None
+
+
+# ----------------- LÓGICA GPT Y TTS ------------------ #
+
+def trim_conversation_history_sync(conversation_history, max_tokens=4000):
+    total_tokens = sum(len(msg["content"].split()) for msg in conversation_history)
+    while total_tokens > max_tokens and len(conversation_history) > 1:
+        removed = conversation_history.pop(1)
+        logger.debug(f"Eliminando mensaje antiguo: {removed}")
+        total_tokens = sum(len(m["content"].split()) for m in conversation_history)
+    return conversation_history
+
+def get_openai_response_sync(conversation_history):
+    """
+    Llamada a GPT-3.5-turbo (sync).
+    """
+    try:
+        start_t = time.time()
+        response = openai.ChatCompletion.create(
+            model="gpt-3.5-turbo",
+            messages=conversation_history,
+        )
+        end_t = time.time()
+        logger.info(f"OpenAI tardó {end_t - start_t:.2f} seg")
+        ans = response["choices"][0]["message"]["content"].strip()
+        if not ans:
+            logger.error("Respuesta vacía de OpenAI.")
+            return "I'm sorry, I couldn't process your request."
+        return ans
+    except Exception as e:
+        logger.error(f"Error con OpenAI: {e}")
+        return "I'm sorry, I had trouble with my AI engine."
+
+def generate_audio_sync(text):
+    """
+    Genera TTS con Eleven Labs (sync).
+    """
+    if not text or len(text.strip()) < 5:
+        logger.error("Texto muy corto para TTS.")
+        return None
+
+    text = text[:5000]
+    text_chunks = split_text(text, MAX_CHAR_LIMIT)
+    audio_files = []
+
+    for idx, chunk in enumerate(text_chunks):
+        success = False
+        attempts = 0
+        while not success and attempts < MAX_RETRIES:
+            attempts += 1
+            try:
+                url = f"https://api.elevenlabs.io/v1/text-to-speech/{VOICE_ID}"
+                headers = {
+                    "Accept": "audio/mpeg",
+                    "Content-Type": "application/json",
+                    "xi-api-key": ELEVENLABS_API_KEY,
+                }
+                data = {
+                    "text": chunk,
+                    "voice_settings": {
+                        "stability": ELEVENLABS_STABILITY,
+                        "similarity_boost": ELEVENLABS_SIMILARITY_BOOST,
+                    },
+                }
+                start_t = time.time()
+                resp = httpx.post(url, json=data, headers=headers)
+                end_t = time.time()
+                logger.info(f"Intento {attempts}, chunk {idx+1}, duró {end_t - start_t:.2f}s")
+
+                if resp.status_code == 200:
+                    if not os.path.exists(STATIC_AUDIO_PATH):
+                        os.makedirs(STATIC_AUDIO_PATH)
+                    timestamp = int(time.time() * 1000)
+                    temp_filename = f"Response_{timestamp}_{idx}.mp3"
+                    temp_path = os.path.join(STATIC_AUDIO_PATH, temp_filename)
+                    with open(temp_path, "wb") as f:
+                        f.write(resp.content)
+                    audio_files.append(temp_path)
+                    success = True
+                else:
+                    logger.error(f"Error TTS chunk {idx+1}: {resp.text}")
+            except Exception as e:
+                logger.error(f"Excepción TTS chunk {idx+1}: {e}")
+
+        if not success:
+            break
+
+    if len(audio_files) != len(text_chunks):
+        logger.error("No se generaron todos los fragmentos TTS.")
+        if os.path.exists(ERROR_AUDIO_PATH):
+            return ERROR_AUDIO_PATH
+        return None
+
+    # Concatenar
+    final_name = f"Response_{int(time.time())}.mp3"
+    final_path = os.path.join(STATIC_AUDIO_PATH, final_name)
+    outcome = concatenate_audio_files_sync(audio_files, final_path)
+    return outcome
+
+def concatenate_audio_files_sync(audio_files, output_path):
+    try:
+        combined = AudioSegment.empty()
+        for af in audio_files:
+            seg = AudioSegment.from_file(af)
+            combined += seg
+        combined.export(output_path, format="mp3")
+        logger.info(f"TTS concatenado -> {output_path}")
+        for af in audio_files:
+            os.remove(af)
+        return output_path
+    except Exception as e:
+        logger.error(f"Error al concatenar TTS: {e}")
+        return None
+
+
+# -------------- LÓGICA ASÍNCRONA PARA AUDIOS ESTÁTICOS -------------- #
+
+async def generate_audio_async(text, audio_path=None):
+    """
+    Sólo para audios de arranque (estáticos).
+    """
+    try:
+        if not text or len(text.strip()) < 5:
+            logger.error("Texto vacío/corto para audio estático.")
+            return None
+
+        text = text[:5000]
+        text_chunks = split_text(text, MAX_CHAR_LIMIT)
+        audio_files = []
+
+        async with httpx.AsyncClient() as client:
+            for idx, chunk in enumerate(text_chunks):
+                success = False
+                attempts = 0
+                while not success and attempts < MAX_RETRIES:
+                    attempts += 1
+                    try:
+                        url = f"https://api.elevenlabs.io/v1/text-to-speech/{VOICE_ID}"
+                        headers = {
+                            "Accept": "audio/mpeg",
+                            "Content-Type": "application/json",
+                            "xi-api-key": ELEVENLABS_API_KEY,
+                        }
+                        data = {
+                            "text": chunk,
+                            "voice_settings": {
+                                "stability": ELEVENLABS_STABILITY,
+                                "similarity_boost": ELEVENLABS_SIMILARITY_BOOST,
+                            },
+                        }
+                        start_t = time.time()
+                        resp = await client.post(url, json=data, headers=headers)
+                        end_t = time.time()
+                        logger.info(f"Audio estático, chunk {idx+1}, intento {attempts}, duró {end_t - start_t:.2f}s")
+
+                        if resp.status_code == 200:
+                            if not os.path.exists(STATIC_AUDIO_PATH):
+                                os.makedirs(STATIC_AUDIO_PATH)
+                            timestamp = int(time.time() * 1000)
+                            temp_filename = f"Response_{timestamp}_{idx}.mp3"
+                            temp_path = os.path.join(STATIC_AUDIO_PATH, temp_filename)
+                            with open(temp_path, "wb") as f:
+                                f.write(resp.content)
+                            audio_files.append(temp_path)
+                            success = True
+                        else:
+                            logger.error(f"Error TTS estático chunk {idx+1}: {resp.text}")
+                    except Exception as e:
+                        logger.error(f"Excepción TTS estático chunk {idx+1}: {e}")
+
+                    if not success and attempts >= MAX_RETRIES:
+                        break
+
+        if len(audio_files) != len(text_chunks):
+            logger.error("No se generaron todos los fragmentos audio estático.")
+            if os.path.exists(ERROR_AUDIO_PATH):
+                return ERROR_AUDIO_PATH
+            return None
+
+        if audio_path is None:
+            audio_path = os.path.join(STATIC_AUDIO_PATH, f"Response_{int(time.time())}.mp3")
+
+        final_path = concatenate_audio_files_sync(audio_files, audio_path)
+        if final_path:
+            logger.info(f"Audio estático final: {final_path}")
+            return final_path
+        else:
+            logger.error("No se pudo concatenar el audio estático.")
+            return None
+
+    except Exception as e:
+        logger.error(f"Error en generate_audio_async: {e}")
+        return None
+
+
+# -------------- AUXILIARES -------------- #
+
+def is_call_active(call_sid):
+    try:
+        call = twilio_client.calls(call_sid).fetch()
+        logger.debug(f"Estado de la llamada: {call.status}")
+        return call.status in ["in-progress", "ringing"]
+    except Exception as e:
+        logger.error(f"Error consultando llamada: {e}")
+        return False
+
+def is_irrelevant(transcript):
+    norm = transcript.strip().lower()
+    norm = norm.translate(str.maketrans('', '', string.punctuation))
+    norm = " ".join(norm.split())
+    irrelevants = [
+        "thank you","ok","great","alright","cool","uh-huh",
+        "i'll wait","i see","um","hmm","thanks","okay","uh huh"
+    ]
+    return norm in irrelevants
+
+def is_farewell(transcript):
+    norm = transcript.strip().lower()
+    norm = norm.translate(str.maketrans('', '', string.punctuation))
+    norm = " ".join(norm.split())
+    farewells = [
+        "goodbye","bye","see you","thank you very much","thats all i needed"
+    ]
+    return norm in farewells
+
+def check_quick_intent(transcript):
+    """
+    Compara con QUICK_INTENTS. Si coincide, regresa la respuesta. 
+    """
+    norm = transcript.lower().translate(str.maketrans('', '', string.punctuation))
+    norm = " ".join(norm.split())
+    if norm in QUICK_INTENTS:
+        return QUICK_INTENTS[norm]
+    return None
+
+def play_audio_to_caller(call_sid, audio_path):
+    try:
+        if not call_sid:
+            logger.error("call_sid es None, no se puede reproducir.")
+            return
+        if not is_call_active(call_sid):
+            logger.error("Llamada no activa, no se reproduce audio.")
+            return
+
+        if not os.path.exists(audio_path):
+            logger.error(f"No existe audio: {audio_path}")
+            if os.path.exists(ERROR_AUDIO_PATH):
+                audio_path = ERROR_AUDIO_PATH
+            else:
+                logger.error("Tampoco existe error.mp3.")
+                return
+
+        audio_url = f"{BASE_URL}/static/{os.path.basename(audio_path)}"
+        logger.info(f"Reproduciendo en Twilio: {audio_url}")
+
+        response = VoiceResponse()
+        response.play(audio_url)
+        response.pause(length=60)
+        response.redirect(TWIML_BIN_URL)
+
+        twilio_client.calls(call_sid).update(twiml=str(response))
+        logger.info("Audio reproducido correctamente.")
+    except Exception as e:
+        logger.error(f"Error reproduciendo audio: {e}", exc_info=True)
+
+
+# -------------- SOCKET /media -------------- #
+
+@app.get("/static/{filename}")
+async def serve_static(filename: str):
+    return FileResponse(path=f"static/{filename}")
+
+@app.websocket("/media")
+async def media_socket(websocket: WebSocket):
+    logger.info("WebSocket con Twilio establecido.")
+    await websocket.accept()
+
+    audio_queue = queue.Queue()
+    stop_event = threading.Event()
+    call_context = {
+        "call_sid": None,
+        "conversation_history": [
+            {
+                "role": "system",
+                # Ajusta este system prompt para personalizar a Jessica
+                "content": (
+                    "You are Jessica, a customer service representative for NetConnect Internet Services. "
+                    "You help with billing, technical support, and general information. "
+                    "You are friendly, but always follow business guidelines."
+                ),
+            }
+        ],
+    }
+
+    # Hilo para procesar audio
+    threading.Thread(
+        target=process_audio,
+        args=(audio_queue, stop_event, call_context),
+        daemon=True
+    ).start()
+
+    try:
+        while not stop_event.is_set():
+            try:
+                message = await websocket.receive_text()
+                if message is None:
+                    logger.info("WebSocket cerrado por cliente.")
+                    break
+                data = json.loads(message)
+                event = data.get("event", "")
+                logger.debug(f"Evento: {event}")
+
+                if event == "start":
+                    call_context["call_sid"] = data["start"]["callSid"]
+                    logger.info(f"Call SID: {call_context['call_sid']}")
+                    welcome_path = os.path.join(STATIC_AUDIO_PATH, "welcome.mp3")
+                    if os.path.exists(welcome_path):
+                        play_audio_to_caller(call_context["call_sid"], welcome_path)
+                    else:
+                        logger.error("No se encontró welcome.mp3")
+
+                elif event == "media":
+                    payload = data["media"]["payload"]
+                    audio_content = base64.b64decode(payload)
+                    audio_queue.put(audio_content)
+                    logger.debug(f"Audio en cola: {len(audio_content)} bytes")
+
+                elif event == "stop":
+                    logger.info("Evento 'stop' -> cerramos WebSocket.")
+                    stop_event.set()
+                    break
+                else:
+                    logger.warning(f"Evento no manejado: {event}")
+            except Exception as e:
+                logger.error(f"Excepción WebSocket: {e}", exc_info=True)
+                break
+    except WebSocketDisconnect:
+        logger.info("WebSocket desconectado.")
+    finally:
+        stop_event.set()
+        await websocket.close()
+        logger.info("WebSocket cerrado al final.")
+
+if __name__ == "__main__":
+    try:
+        port = int(os.getenv("PORT", 8080))
+        logger.info(f"Iniciando servidor en puerto {port}...")
+        uvicorn.run(app, host="0.0.0.0", port=port)
+    except Exception as e:
+        logger.error(f"Error General: {e}", exc_info=True)
